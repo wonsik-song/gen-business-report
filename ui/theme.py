@@ -50,7 +50,9 @@ def apply_global_theme() -> None:
         [data-testid="stChatMessage"] {
             border: 1px solid var(--gb-border);
             border-radius: 12px;
-            padding: 0.2rem 0.2rem;
+            padding: 1rem;
+            background: var(--gb-panel-bg);
+            margin-bottom: 0.8rem;
         }
         .stButton>button {
             border-radius: 10px;

@@ -2,7 +2,7 @@ import json
 import asyncio
 import time
 import warnings
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from .prompts import HOST_ORCHESTRATION_SYSTEM
 from .evaluator import EvaluatorAgent
@@ -147,110 +147,90 @@ class HostAgent:
     def finalize_current_version(self, source: str = "host_chat_intent") -> bool:
         return self.save_tool.finalize_version(source=source)
 
-    def execute_selected_tool(
-        self,
-        selected_tool: str,
-        tool_args: Optional[Dict[str, object]] = None,
-    ) -> Dict[str, object]:
-        args = tool_args or {}
-        tool_name = (selected_tool or "").strip()
-        if tool_name == "_adk_load_current_draft":
-            return self.load_current_draft()
-        if tool_name == "_adk_load_finalized_document":
-            version_num = args.get("version_num")
-            if not isinstance(version_num, int):
-                version_num = None
-            return self.load_finalized_document(version_num=version_num)
-        if tool_name == "_adk_finalize_current_version":
-            source = str(args.get("source") or "host_chat_intent")
-            ok = self.finalize_current_version(source=source)
-            return {"status": "SUCCESS" if ok else "FAILED"}
-        if tool_name == "_adk_save_current_draft":
-            content_md = str(args.get("content_md") or "")
-            source = str(args.get("source") or "host_chat_intent")
-            ok = self.save_tool.save(content_md, source=source)
-            return {"status": "SUCCESS" if ok else "FAILED"}
-        return {"status": "FAILED", "reason": f"UNKNOWN_TOOL:{tool_name}"}
-
-    def choose_execution(
+    def orchestrate_chat(
         self,
         user_input: str,
         phase: str,
-        has_document: bool,
+        current_md: str,
         latest_eval: Optional[Dict[str, object]] = None,
-        current_md: str = "",
+        rubric: str = "",
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Dict[str, object]:
-        eval_snapshot = None
-        if isinstance(latest_eval, dict) and latest_eval:
-            eval_snapshot = {
-                "status": latest_eval.get("status"),
-                "total_score": latest_eval.get("total_score"),
-                "summary": latest_eval.get("summary"),
-                "missing_points": (latest_eval.get("missing_points") or [])[:5]
-                if isinstance(latest_eval.get("missing_points"), list)
-                else [],
-            }
-        current_doc_excerpt = (current_md or "").strip()[:1500]
-
+        eval_snapshot = latest_eval if isinstance(latest_eval, dict) else {}
         adk_res = self._try_adk_invoke(
-            task_type="decide_execution",
+            task_type="chat_orchestrate",
             payload={
                 "user_input": user_input,
                 "phase": phase,
-                "has_document": has_document,
-                "latest_eval_snapshot": eval_snapshot,
-                "current_doc_excerpt": current_doc_excerpt,
-                "agent_cards": self.get_agent_cards(),
-                "tool_cards": self.get_tool_cards(),
+                "current_md": current_md or "",
+                "latest_eval": eval_snapshot,
+                "rubric": rubric or "",
                 "decision_schema": {
-                    "selected_agent": "host|planner|evaluator",
-                    "selected_tool": "tool name or empty string",
+                    "selected_subagent": "planner_subagent|evaluator_subagent|none",
+                    "selected_tool": (
+                        "_adk_load_current_draft|_adk_load_finalized_document|"
+                        "_adk_finalize_current_version|empty"
+                    ),
                     "tool_args": {},
-                    "planner_mode": "OUTLINE|FULL_DOCUMENT|REVISE|optional",
-                    "host_action": "NONE|SUMMARIZE_LATEST_EVAL|SUMMARIZE_CURRENT_DOC|GENERAL_RESPONSE",
+                    "planner_mode": "OUTLINE|FULL_DOCUMENT|REVISE|empty",
                     "needs_clarification": False,
                     "message": "assistant message",
                 },
-                "routing_rule": (
-                    "Choose intent semantically from user input and current state. "
-                    "Do not use fixed keyword matching. "
-                    "If user asks to run a new evaluation, select evaluator. "
-                    "If user asks about existing evaluation result, select host with "
-                    "host_action=SUMMARIZE_LATEST_EVAL (when latest_eval_snapshot exists). "
-                    "If user asks to summarize current planner document, select host with "
-                    "host_action=SUMMARIZE_CURRENT_DOC. Return JSON only."
+                "execution_rule": (
+                    "Decide by selecting selected_subagent and selected_tool. "
+                    "Do not return action field. "
+                    "Use planner_subagent for outline/full_document/revise and set planner_mode. "
+                    "Use evaluator_subagent when evaluation should run. "
+                    "Use host tool selection only for load/finalize. "
+                    "If only explanation/summary is needed, choose selected_subagent=none and provide message. "
+                    "Return JSON only."
                 ),
             },
             max_attempts=3,
+            progress_callback=progress_callback,
         )
-        if isinstance(adk_res, dict):
-            selected_agent = str(adk_res.get("selected_agent") or "").strip().lower()
-            selected_tool = str(adk_res.get("selected_tool") or "").strip()
-            planner_mode = str(adk_res.get("planner_mode") or "").strip().upper()
-            host_action = str(adk_res.get("host_action") or "NONE").strip().upper()
-            tool_args = adk_res.get("tool_args") if isinstance(adk_res.get("tool_args"), dict) else {}
-            needs_clarification = bool(adk_res.get("needs_clarification"))
-            message = str(adk_res.get("message") or "").strip()
+        if not isinstance(adk_res, dict):
+            return {"handled": False}
 
-            if selected_agent in {"host", "planner", "evaluator"}:
-                return {
-                    "selected_agent": selected_agent,
-                    "selected_tool": selected_tool,
-                    "tool_args": tool_args,
-                    "planner_mode": planner_mode,
-                    "host_action": host_action,
-                    "needs_clarification": needs_clarification,
-                    "message": message,
-                }
+        selected_subagent = str(adk_res.get("selected_subagent") or "none").strip().lower()
+        selected_tool = str(adk_res.get("selected_tool") or "").strip()
+        planner_mode = str(adk_res.get("planner_mode") or "").strip().upper()
+        message = str(adk_res.get("message") or "").strip()
+        needs_clarification = bool(adk_res.get("needs_clarification"))
+        tool_args = adk_res.get("tool_args") if isinstance(adk_res.get("tool_args"), dict) else {}
 
-        if not self.adk_enabled:
-            return {
-                "needs_clarification": True,
-                "message": "ADK 라우팅이 비활성 상태입니다. 원하는 작업을 한 문장으로 다시 말씀해 주세요.",
-            }
+        # Normalize common sentinel values emitted by models.
+        if selected_subagent in {"", "empty", "null"}:
+            selected_subagent = "none"
+        if selected_tool.lower() in {"empty", "none", "null"}:
+            selected_tool = ""
+        if planner_mode in {"EMPTY", "NONE", "NULL"}:
+            planner_mode = ""
+
+        valid_subagents = {"planner_subagent", "evaluator_subagent", "none"}
+        valid_tools = {
+            "",
+            "_adk_load_current_draft",
+            "_adk_load_finalized_document",
+            "_adk_finalize_current_version",
+        }
+        valid_planner_modes = {"", "OUTLINE", "FULL_DOCUMENT", "REVISE"}
+
+        if selected_subagent not in valid_subagents:
+            return {"handled": False}
+        if selected_tool not in valid_tools:
+            return {"handled": False}
+        if planner_mode not in valid_planner_modes:
+            return {"handled": False}
+
         return {
-            "needs_clarification": True,
-            "message": "의도 라우팅 결과를 받지 못했습니다. 원하는 작업을 한 문장으로 다시 말씀해 주세요.",
+            "handled": True,
+            "selected_subagent": selected_subagent,
+            "selected_tool": selected_tool,
+            "planner_mode": planner_mode,
+            "tool_args": tool_args,
+            "needs_clarification": needs_clarification,
+            "message": message,
         }
 
     def _build_eval_result_message(self, latest_eval: Dict[str, object]) -> str:
@@ -324,73 +304,10 @@ class HostAgent:
             result_lines.append("- 참고: 최신 평가 결과는 없어 문서 내용 기준으로만 요약했습니다.")
         return "\n".join(result_lines)
 
-    def auto_select_and_prepare(
-        self,
-        user_input: str,
-        phase: str,
-        has_document: bool,
-        latest_eval: Optional[Dict[str, object]] = None,
-        current_md: str = "",
-    ) -> Dict[str, object]:
-        decision = self.choose_execution(
-            user_input=user_input,
-            phase=phase,
-            has_document=has_document,
-            latest_eval=latest_eval,
-            current_md=current_md,
-        )
-        selected_tool = str(decision.get("selected_tool") or "").strip()
-        tool_args = decision.get("tool_args") if isinstance(decision.get("tool_args"), dict) else {}
-        selected_agent = str(decision.get("selected_agent") or "").strip().lower()
-        host_action = str(decision.get("host_action") or "NONE").strip().upper()
-
-        prepared = dict(decision)
-        if selected_agent == "host":
-            if host_action == "SUMMARIZE_LATEST_EVAL" and isinstance(latest_eval, dict) and latest_eval:
-                prepared["message"] = self._build_eval_result_message(latest_eval)
-                prepared["host_answer_only"] = True
-            elif host_action == "SUMMARIZE_CURRENT_DOC" and (current_md or "").strip():
-                prepared["message"] = self._build_document_summary_message(
-                    current_md=current_md,
-                    latest_eval=latest_eval,
-                )
-                prepared["host_answer_only"] = True
-
-        if selected_tool in {"_adk_load_current_draft", "_adk_load_finalized_document"}:
-            if selected_tool == "_adk_load_current_draft":
-                load_target = "draft"
-                version_num = None
-            else:
-                load_target = "finalized"
-                version_num = tool_args.get("version_num")
-                if not isinstance(version_num, int):
-                    version_num = None
-            prepared["load_intent"] = {"target": load_target, "version_num": version_num}
-        return prepared
-
     def _build_adk_topology(self) -> None:
         """Build ADK-style hierarchy: host coordinator -> planner/evaluator sub_agents."""
-        self._adk_planner_agent = self._create_llm_agent_with_tools(
-            name="planner_subagent",
-            model=self.planner_model,
-            description="Generates and revises PRD markdown documents.",
-            instruction=(
-                "You are a planner subagent. Generate outline/full document and revise markdown. "
-                "Return markdown only. "
-                "If document content is newly generated or revised, call the tool "
-                "`_adk_save_current_draft` with the full markdown."
-            ),
-            tools=[self._adk_save_current_draft],
-        )
-        self._adk_evaluator_agent = self._create_llm_agent_with_tools(
-            name="evaluator_subagent",
-            model=self.evaluator_model,
-            description="Evaluates PRD markdown and returns structured result.",
-            instruction=(
-                "You are an evaluator subagent. Return structured JSON with "
-                "status, total_score, category_scores, summary, strengths, missing_points."
-            ),
-        )
+        self._adk_planner_agent = self.planner_agent.get_llm_subagent()
+        self._adk_evaluator_agent = self.evaluator_agent.get_llm_subagent()
         self._adk_host_agent = self._create_llm_agent_with_tools(
             name="host_coordinator",
             model=self.host_model,
@@ -401,9 +318,9 @@ class HostAgent:
                 "`_adk_finalize_current_version`. "
                 "When context is needed, load documents with `_adk_load_current_draft` "
                 "or `_adk_load_finalized_document`. "
-                "For routing requests, inspect the provided agent_cards/tool_cards and "
-                "return a JSON decision with selected_agent, selected_tool, tool_args, "
-                "planner_mode, needs_clarification, and message."
+                "For planning and evaluation, delegate to planner_subagent/evaluator_subagent. "
+                "Use host tools only for save/load/finalize. Return only the response JSON "
+                "defined by the orchestration response schema."
             ),
             tools=[
                 self._adk_save_current_draft,
@@ -411,7 +328,11 @@ class HostAgent:
                 self._adk_load_current_draft,
                 self._adk_load_finalized_document,
             ],
-            sub_agents=[self._adk_planner_agent, self._adk_evaluator_agent],
+            sub_agents=[
+                agent
+                for agent in [self._adk_planner_agent, self._adk_evaluator_agent]
+                if agent is not None
+            ],
         )
 
     def get_agent_cards(self) -> Dict[str, Dict[str, str]]:
@@ -499,6 +420,7 @@ class HostAgent:
         task_type: str,
         payload: Dict[str, object],
         max_attempts: int = 1,
+        progress_callback: Optional[Callable[[str], None]] = None,
     ) -> Optional[Dict[str, object]]:
         """
         Try ADK host invocation. If runtime/API shape is unavailable, return None
@@ -536,20 +458,19 @@ class HostAgent:
                         quiet=True,
                     )
                     if asyncio.iscoroutine(events):
-                        events = asyncio.run(events)
+                        events = self._run_coroutine_blocking(events)
+                    if hasattr(events, "__aiter__"):
+                        events = self._run_coroutine_blocking(self._collect_async_events(events))
                     if isinstance(events, list):
-                        for event in reversed(events):
-                            content = getattr(event, "content", None)
-                            parts = getattr(content, "parts", None)
-                            if parts:
-                                text = "".join(
-                                    getattr(part, "text", "") or ""
-                                    for part in parts
-                                    if getattr(part, "text", None)
-                                ).strip()
-                                parsed = self._extract_adk_response(text)
-                                if isinstance(parsed, dict):
-                                    return parsed
+                        latest_parsed = None
+                        for event in events:
+                            if progress_callback is not None:
+                                self._emit_adk_progress(event, progress_callback)
+                            parsed = self._extract_adk_response(event)
+                            if isinstance(parsed, dict):
+                                latest_parsed = parsed
+                        if isinstance(latest_parsed, dict):
+                            return latest_parsed
 
                 # Legacy API compatibility path.
                 result = None
@@ -570,6 +491,62 @@ class HostAgent:
             if idx < attempts - 1:
                 time.sleep(0.2 * (idx + 1))
         return None
+
+    async def _collect_async_events(self, async_iterable) -> list:
+        events = []
+        async for event in async_iterable:
+            events.append(event)
+        return events
+
+    def _run_coroutine_blocking(self, coroutine_obj):
+        try:
+            return asyncio.run(coroutine_obj)
+        except RuntimeError:
+            # Fallback when an event loop is already active in runtime.
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coroutine_obj)
+            finally:
+                loop.close()
+
+    def _emit_adk_progress(self, event: object, callback: Callable[[str], None]) -> None:
+        content = getattr(event, "content", None)
+        parts = getattr(content, "parts", None) if content is not None else None
+        if not parts:
+            return
+        for part in parts:
+            function_call = getattr(part, "function_call", None)
+            if function_call is not None:
+                name = str(getattr(function_call, "name", "") or "").strip()
+                if name:
+                    callback(f"tool 호출: `{name}`")
+                continue
+
+            function_response = getattr(part, "function_response", None)
+            if function_response is not None:
+                name = str(getattr(function_response, "name", "") or "").strip()
+                response = getattr(function_response, "response", None)
+                if isinstance(response, dict):
+                    status = str(response.get("status") or "").strip()
+                    if name and status:
+                        callback(f"tool 응답: `{name}` ({status})")
+                    elif name:
+                        callback(f"tool 응답: `{name}`")
+                    elif status:
+                        callback(f"tool 응답 상태: {status}")
+                elif name:
+                    callback(f"tool 응답: `{name}`")
+                continue
+
+            part_text = getattr(part, "text", None)
+            if isinstance(part_text, str):
+                text = part_text.strip()
+                if not text:
+                    continue
+                if text.startswith("{") and text.endswith("}"):
+                    continue
+                preview = text[:140]
+                callback(preview)
 
     def _extract_adk_response(self, result: object) -> Optional[Dict[str, object]]:
         if result is None:

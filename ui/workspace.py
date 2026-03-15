@@ -295,138 +295,161 @@ def _handle_chat_input(user_input: str, user, proj):
 
     phase = st.session_state.chat_phase
     host = st.session_state.host_agent
+    current_md = st.session_state.get("chat_preview_md") or ""
+    latest_eval = st.session_state.get("latest_eval_result")
+    progress_lines = []
 
-    execution = host.auto_select_and_prepare(
-        user_input=user_input,
-        phase=phase,
-        has_document=bool((st.session_state.get("chat_preview_md") or "").strip()),
-        latest_eval=st.session_state.get("latest_eval_result"),
-        current_md=st.session_state.get("chat_preview_md") or "",
-    )
-    selected_agent = str(execution.get("selected_agent") or "").strip().lower()
-    selected_tool = str(execution.get("selected_tool") or "").strip()
-    tool_args = execution.get("tool_args") if isinstance(execution.get("tool_args"), dict) else {}
-    planner_mode = str(execution.get("planner_mode") or "").strip().upper()
-    intent_message = execution.get("message") if isinstance(execution, dict) else None
+    with st.chat_message("assistant", avatar="🤖"):
+        progress_placeholder = st.empty()
+        progress_placeholder.markdown("실행 중...")
 
-    if execution.get("needs_clarification"):
+        def _on_progress(line: str):
+            text = str(line or "").strip()
+            if not text:
+                return
+            if progress_lines and progress_lines[-1] == text:
+                return
+            progress_lines.append(text)
+            if len(progress_lines) > 10:
+                progress_lines.pop(0)
+            progress_placeholder.markdown(
+                "**중간 실행 로그**\n" + "\n".join(f"- {item}" for item in progress_lines)
+            )
+
+        orchestrated = host.orchestrate_chat(
+            user_input=user_input,
+            phase=phase,
+            current_md=current_md,
+            latest_eval=latest_eval,
+            rubric=_resolve_active_rubric(user, proj),
+            progress_callback=_on_progress,
+        )
+
+    if progress_lines:
         _add_msg(
             "assistant",
-            intent_message or "요청 의도를 명확히 이해하지 못했습니다. 원하는 작업을 다시 말씀해주세요.",
+            "**중간 실행 로그**\n" + "\n".join(f"- {item}" for item in progress_lines),
         )
-        st.rerun()
-        return
+    if isinstance(orchestrated, dict) and orchestrated.get("handled"):
+        selected_subagent = str(orchestrated.get("selected_subagent") or "none").strip().lower()
+        selected_tool = str(orchestrated.get("selected_tool") or "").strip()
+        planner_mode = str(orchestrated.get("planner_mode") or "").strip().upper()
+        tool_args = orchestrated.get("tool_args") if isinstance(orchestrated.get("tool_args"), dict) else {}
+        needs_clarification = bool(orchestrated.get("needs_clarification"))
+        message = str(orchestrated.get("message") or "").strip()
 
-    if execution.get("host_answer_only"):
-        _add_msg("assistant", intent_message or "최근 평가 결과를 찾지 못했습니다.")
-        st.rerun()
-        return
-
-    if selected_tool in {"_adk_load_current_draft", "_adk_load_finalized_document"}:
-        load_intent = execution.get("load_intent") if isinstance(execution.get("load_intent"), dict) else None
-        if not load_intent:
-            load_intent = {
-                "target": "draft" if selected_tool == "_adk_load_current_draft" else "finalized",
-                "version_num": tool_args.get("version_num"),
-            }
-        if _try_load_document_from_intent(host, load_intent):
+        if needs_clarification:
+            _add_msg("assistant", message or "요청 의도를 조금 더 구체적으로 알려주세요.")
             st.rerun()
             return
 
-    if selected_agent == "evaluator":
-        if phase == "OUTLINE_READY":
-            _add_msg("assistant", "현재는 목차 단계입니다. 본문 생성 후 평가를 진행할 수 있습니다.")
-            st.rerun()
-            return
-        _add_msg("assistant", "요청을 평가 실행으로 이해했습니다. 현재 문서를 평가합니다.")
-        _run_evaluation(user, proj)
-        return
-
-    if selected_tool == "_adk_finalize_current_version":
-        latest_eval = st.session_state.get("latest_eval_result") or {}
-        score = latest_eval.get("total_score")
-        can_finalize = (
-            latest_eval.get("status") == "SUCCESS"
-            and isinstance(score, (int, float))
-            and score >= 95
-        )
-        if not can_finalize:
-            _add_msg("assistant", "확정은 최신 평가 점수가 95점 이상일 때 가능합니다. 먼저 평가를 진행해주세요.")
-            st.rerun()
-            return
-        if st.session_state.get("host_requires_confirmation") and not st.session_state.get("host_user_confirmed"):
-            _add_msg("assistant", "먼저 컨펌이 필요합니다. 우측 Host 제어센터에서 컨펌 후 다시 요청해주세요.")
-            st.rerun()
-            return
-        if st.session_state.chat_preview_md:
-            upsert_draft(proj["id"], st.session_state.chat_preview_md)
-        finalize_res = host.execute_selected_tool(
-            selected_tool="_adk_finalize_current_version",
-            tool_args={"source": "host_chat_intent"},
-        )
-        ok = str(finalize_res.get("status") or "") == "SUCCESS"
-        if ok:
-            save_audit_log(user.id, "FINALIZE_VERSION", "INFO", {"project_id": proj["id"], "trigger": "chat_intent"})
-            st.session_state.host_requires_confirmation = False
-            st.session_state.host_user_confirmed = False
-            st.session_state.host_completion_status = ""
-            _sync_host_guidance(announce=True, prefix="요청에 따라 확정 저장을 완료했습니다.")
-            _add_msg("assistant", "요청하신 대로 버전을 확정 저장했습니다.")
-        else:
-            _add_msg("assistant", "확정 저장에 실패했습니다. 현재 프로젝트 상태를 확인해주세요.")
-        st.rerun()
-        return
-
-    if selected_agent != "planner":
-        if selected_agent == "host" and intent_message:
-            _add_msg("assistant", intent_message)
-        else:
-            _add_msg("assistant", intent_message or "요청을 처리할 수 있는 작업으로 해석하지 못했습니다. 다시 말씀해주세요.")
-        st.rerun()
-        return
-
-    if phase == "IDLE":
-        if planner_mode and planner_mode != "OUTLINE":
-            _add_msg("assistant", "현재 초기 단계에서는 목차 생성을 먼저 진행합니다.")
-            st.rerun()
-            return
-        if get_daily_generate_count(user.id) >= 50:
-            _add_msg("assistant", "일일 생성 한도(50회)에 도달했습니다. 내일 다시 시도해주세요.")
-            save_audit_log(user.id, "RATE_LIMIT", "WARN", {"feature": "generate"})
+        if selected_tool in {"_adk_load_current_draft", "_adk_load_finalized_document"}:
+            load_target = "draft" if selected_tool == "_adk_load_current_draft" else "finalized"
+            version_num = tool_args.get("version_num")
+            if not isinstance(version_num, int):
+                version_num = None
+            load_payload = host.load_document_with_fallback(target=load_target, version_num=version_num)
+            if str(load_payload.get("status") or "") == "SUCCESS":
+                _load_doc_to_editor(
+                    {
+                        "id": load_payload.get("document_id"),
+                        "content_md": load_payload.get("content_md", "") or "",
+                    },
+                    phase="DOCUMENT_READY",
+                )
+                _add_msg("assistant", message or "요청한 문서를 불러왔습니다.")
+            else:
+                _add_msg("assistant", message or "요청한 문서를 불러오지 못했습니다.")
             st.rerun()
             return
 
-        with st.spinner("목차를 생성하고 있습니다..."):
-            try:
-                outline = host.plan(mode="OUTLINE", user_intent=user_input, context_text="")
-                st.session_state.chat_preview_md = outline
-                st.session_state.chat_phase = "OUTLINE_READY"
-                _sync_host_guidance(announce=True, prefix="목차를 생성했습니다.")
-                _add_msg("assistant",
-                         "목차를 생성했습니다. 오른쪽에서 확인하세요.\n\n"
-                         "- 수정이 필요하면 채팅으로 요청하세요.\n"
-                         "- 만족하시면 **\"본문 생성해줘\"** 라고 입력하세요.")
-                save_audit_log(user.id, "GENERATE_SUCCESS", "INFO", {"mode": "OUTLINE"})
-            except Exception as e:
-                _add_msg("assistant", f"생성 실패: {e}")
-                save_audit_log(user.id, "GENERATE_FAILED", "ERROR", {"error": str(e)})
-        st.rerun()
-
-    elif phase == "OUTLINE_READY":
-        if planner_mode == "FULL_DOCUMENT":
-            if get_daily_generate_count(user.id) >= 50:
-                _add_msg("assistant", "일일 생성 한도(50회)에 도달했습니다.")
-                save_audit_log(user.id, "RATE_LIMIT", "WARN", {"feature": "generate"})
+        if selected_tool == "_adk_finalize_current_version":
+            latest_eval = st.session_state.get("latest_eval_result") or {}
+            score = latest_eval.get("total_score")
+            can_finalize = (
+                latest_eval.get("status") == "SUCCESS"
+                and isinstance(score, (int, float))
+                and score >= 95
+            )
+            if not can_finalize:
+                _add_msg("assistant", "확정은 최신 평가 점수가 95점 이상일 때 가능합니다. 먼저 평가를 진행해주세요.")
                 st.rerun()
                 return
+            if st.session_state.get("host_requires_confirmation") and not st.session_state.get("host_user_confirmed"):
+                _add_msg("assistant", "먼저 컨펌이 필요합니다. 우측 Host 제어센터에서 컨펌 후 다시 요청해주세요.")
+                st.rerun()
+                return
+            if st.session_state.chat_preview_md:
+                upsert_draft(proj["id"], st.session_state.chat_preview_md)
+            ok = host.finalize_current_version(source="host_chat_intent")
+            if ok:
+                save_audit_log(user.id, "FINALIZE_VERSION", "INFO", {"project_id": proj["id"], "trigger": "chat_intent"})
+                st.session_state.host_requires_confirmation = False
+                st.session_state.host_user_confirmed = False
+                st.session_state.host_completion_status = ""
+                _sync_host_guidance(announce=True, prefix="Host가 확정 저장을 완료했습니다.")
+                _add_msg("assistant", message or "확정 저장을 완료했습니다.")
+            else:
+                _add_msg("assistant", message or "확정 저장에 실패했습니다.")
+            st.rerun()
+            return
 
-            with st.spinner("본문을 생성하고 있습니다..."):
-                try:
+        if selected_subagent == "evaluator_subagent":
+            if phase == "OUTLINE_READY":
+                _add_msg("assistant", "현재는 목차 단계입니다. 본문 생성 후 평가를 진행할 수 있습니다.")
+                st.rerun()
+                return
+            completion = _run_host_completion_cycle(
+                user=user,
+                proj=proj,
+                md=st.session_state.get("chat_preview_md") or "",
+                trigger="host_orchestrated",
+            )
+            if completion:
+                _add_msg("assistant", message or "평가를 완료했습니다.")
+            else:
+                _add_msg("assistant", message or "평가를 완료하지 못했습니다.")
+            st.rerun()
+            return
+
+        if selected_subagent == "planner_subagent":
+            if not planner_mode:
+                planner_mode = "OUTLINE" if phase == "IDLE" else "REVISE"
+
+            try:
+                if planner_mode == "OUTLINE":
+                    if get_daily_generate_count(user.id) >= 50:
+                        _add_msg("assistant", "일일 생성 한도(50회)에 도달했습니다. 내일 다시 시도해주세요.")
+                        save_audit_log(user.id, "RATE_LIMIT", "WARN", {"feature": "generate"})
+                        st.rerun()
+                        return
+                    outline = host.plan(mode="OUTLINE", user_intent=user_input, context_text="")
+                    st.session_state.chat_preview_md = outline
+                    st.session_state.chat_phase = "OUTLINE_READY"
+                    st.session_state.host_requires_confirmation = False
+                    st.session_state.host_user_confirmed = False
+                    st.session_state.host_completion_status = ""
+                    _sync_host_guidance(announce=True, prefix="목차 생성이 완료되었습니다.")
+                    _add_msg("assistant", message or "목차를 생성했습니다.")
+                    st.rerun()
+                    return
+
+                if planner_mode == "FULL_DOCUMENT":
+                    if get_daily_generate_count(user.id) >= 50:
+                        _add_msg("assistant", "일일 생성 한도(50회)에 도달했습니다. 내일 다시 시도해주세요.")
+                        save_audit_log(user.id, "RATE_LIMIT", "WARN", {"feature": "generate"})
+                        st.rerun()
+                        return
+                    outline_md = st.session_state.get("chat_preview_md") or ""
+                    if not outline_md.strip():
+                        _add_msg("assistant", "본문 생성을 위해 먼저 목차가 필요합니다.")
+                        st.rerun()
+                        return
                     full_doc = host.plan(
                         mode="FULL_DOCUMENT",
                         user_intent=user_input,
                         context_text="",
-                        outline_md=st.session_state.chat_preview_md,
+                        outline_md=outline_md,
                     )
                     st.session_state.chat_preview_md = full_doc
                     st.session_state.chat_phase = "DOCUMENT_READY"
@@ -434,50 +457,40 @@ def _handle_chat_input(user_input: str, user, proj):
                     st.session_state.host_user_confirmed = False
                     st.session_state.host_completion_status = ""
                     _sync_host_guidance(announce=True, prefix="본문 생성이 완료되었습니다.")
-                    _add_msg("assistant",
-                             "전체 기획서를 생성했습니다. 오른쪽에서 확인하세요.\n\n"
-                             "- 채팅으로 수정 요청이 가능합니다.\n"
-                             "- **편집** 버튼으로 직접 수정할 수 있습니다.\n"
-                             "- **평가** 버튼으로 AI 평가를 받을 수 있습니다.")
-                    save_audit_log(user.id, "GENERATE_SUCCESS", "INFO", {"mode": "FULL_DOCUMENT"})
-                except Exception as e:
-                    _add_msg("assistant", f"생성 실패: {e}")
-                    save_audit_log(user.id, "GENERATE_FAILED", "ERROR", {"error": str(e)})
-        else:
-            with st.spinner("목차를 수정하고 있습니다..."):
-                try:
-                    revision_request = _build_revision_request_with_eval(user_input)
-                    revised = host.revise(
-                        current_md=st.session_state.chat_preview_md,
-                        revision_request=revision_request,
-                    )
-                    st.session_state.chat_preview_md = revised
-                    st.session_state.host_requires_confirmation = False
-                    st.session_state.host_user_confirmed = False
-                    st.session_state.host_completion_status = ""
-                    _sync_host_guidance(announce=True, prefix="목차 수정이 완료되었습니다.")
-                    _add_msg("assistant", "목차를 수정했습니다. 오른쪽에서 확인하세요.")
-                except Exception as e:
-                    _add_msg("assistant", f"수정 실패: {e}")
-        st.rerun()
+                    _add_msg("assistant", message or "전체 기획서를 생성했습니다.")
+                    st.rerun()
+                    return
 
-    elif phase == "DOCUMENT_READY":
-        with st.spinner("기획서를 수정하고 있습니다..."):
-            try:
                 revision_request = _build_revision_request_with_eval(user_input)
                 revised = host.revise(
-                    current_md=st.session_state.chat_preview_md,
+                    current_md=st.session_state.get("chat_preview_md") or "",
                     revision_request=revision_request,
                 )
                 st.session_state.chat_preview_md = revised
+                st.session_state.chat_phase = "DOCUMENT_READY" if phase != "IDLE" else "OUTLINE_READY"
                 st.session_state.host_requires_confirmation = False
                 st.session_state.host_user_confirmed = False
                 st.session_state.host_completion_status = ""
                 _sync_host_guidance(announce=True, prefix="문서 수정이 완료되었습니다.")
-                _add_msg("assistant", "기획서를 수정했습니다. 사용자 요청과 평가 피드백을 함께 반영했습니다.")
+                _add_msg("assistant", message or "요청 사항을 반영해 문서를 수정했습니다.")
+                st.rerun()
+                return
             except Exception as e:
-                _add_msg("assistant", f"수정 실패: {e}")
-        st.rerun()
+                _add_msg("assistant", message or f"요청 처리 중 오류가 발생했습니다: {e}")
+                st.rerun()
+                return
+
+        if selected_subagent == "none":
+            st.session_state.host_requires_confirmation = False
+            _add_msg("assistant", message or "요청을 처리했습니다.")
+            st.rerun()
+            return
+
+    _add_msg(
+        "assistant",
+        "Host 자동 실행 결과를 받지 못했습니다. 현재는 LlmAgent의 tool 호출 결과만 처리하도록 설정되어 있어 다시 시도해주세요.",
+    )
+    st.rerun()
 
 
 def _run_evaluation(user, proj):
@@ -686,7 +699,8 @@ def render_workspace():
         chat_container = st.container(height=520)
         with chat_container:
             for msg in st.session_state.chat_messages:
-                with st.chat_message(msg["role"]):
+                avatar = "🧑‍💻" if msg["role"] == "user" else "🤖"
+                with st.chat_message(msg["role"], avatar=avatar):
                     st.markdown(msg["content"])
 
         user_input = st.chat_input(
