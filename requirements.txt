@@ -1,0 +1,8 @@
+streamlit
+supabase
+python-dotenv
+pandas
+google-genai
+google-adk
+pydantic
+tenacity
